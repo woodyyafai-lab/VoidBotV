@@ -2,38 +2,25 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const twilio = require('twilio');
 const Anthropic = require('@anthropic-ai/sdk');
-const admin = require('firebase-admin');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 // ─────────────────────────────────────────────
-// CONFIG — set these as environment variables
+// CONFIG — set these in Railway Variables tab
 // ─────────────────────────────────────────────
 const TWILIO_ACCOUNT_SID  = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN   = process.env.TWILIO_AUTH_TOKEN;
 const ANTHROPIC_API_KEY   = process.env.ANTHROPIC_API_KEY;
 const PORT                = process.env.PORT || 3000;
 
-// Firebase service account JSON stored as an env variable
-const FIREBASE_SERVICE_ACCOUNT = process.env.FIREBASE_SERVICE_ACCOUNT
-  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-  : null;
+// Your Firebase web config values (from the config you already have)
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'whatsapp-bot-6a12f';
+const FIREBASE_API_KEY    = process.env.FIREBASE_API_KEY    || 'AIzaSyBqO5_NAA924fi9quruMk1_NdgZIcLyXsM';
 
-// ─────────────────────────────────────────────
-// FIREBASE INIT
-// ─────────────────────────────────────────────
-let db = null;
-if (FIREBASE_SERVICE_ACCOUNT) {
-  admin.initializeApp({
-    credential: admin.credential.cert(FIREBASE_SERVICE_ACCOUNT)
-  });
-  db = admin.firestore();
-  console.log('✅ Firebase connected');
-} else {
-  console.warn('⚠️  Firebase not configured — running without persistence');
-}
+// Firestore REST API base URL
+const FS_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
 
 // ─────────────────────────────────────────────
 // ANTHROPIC CLIENT
@@ -41,77 +28,126 @@ if (FIREBASE_SERVICE_ACCOUNT) {
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 // ─────────────────────────────────────────────
-// IN-MEMORY STORE (per phone number session)
+// IN-MEMORY SESSION STORE (per phone number)
 // ─────────────────────────────────────────────
 const sessions = {};
-
 function getSession(phone) {
-  if (!sessions[phone]) {
-    sessions[phone] = { history: [] };
-  }
+  if (!sessions[phone]) sessions[phone] = { history: [] };
   return sessions[phone];
 }
 
 // ─────────────────────────────────────────────
-// FIREBASE HELPERS
+// FIRESTORE REST HELPERS
+// ─────────────────────────────────────────────
+
+// Convert Firestore REST format to plain JS object
+function fromFirestore(fields) {
+  if (!fields) return {};
+  const obj = {};
+  for (const [key, val] of Object.entries(fields)) {
+    if (val.stringValue  !== undefined) obj[key] = val.stringValue;
+    else if (val.integerValue !== undefined) obj[key] = parseInt(val.integerValue);
+    else if (val.doubleValue  !== undefined) obj[key] = val.doubleValue;
+    else if (val.booleanValue !== undefined) obj[key] = val.booleanValue;
+    else if (val.nullValue    !== undefined) obj[key] = null;
+    else if (val.mapValue     !== undefined) obj[key] = fromFirestore(val.mapValue.fields);
+    else obj[key] = JSON.stringify(val);
+  }
+  return obj;
+}
+
+// Convert plain JS object to Firestore REST format
+function toFirestore(obj) {
+  const fields = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (typeof val === 'string')  fields[key] = { stringValue: val };
+    else if (typeof val === 'number') fields[key] = { integerValue: String(Math.round(val)) };
+    else if (typeof val === 'boolean') fields[key] = { booleanValue: val };
+    else if (val === null) fields[key] = { nullValue: null };
+    else if (typeof val === 'object') fields[key] = { mapValue: { fields: toFirestore(val).fields } };
+  }
+  return { fields };
+}
+
+async function fsGet(path) {
+  try {
+    const res = await fetch(`${FS_BASE}/${path}?key=${FIREBASE_API_KEY}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return fromFirestore(data.fields);
+  } catch(e) { console.error('fsGet error', e); return null; }
+}
+
+async function fsSet(path, obj) {
+  try {
+    // Build update mask from keys
+    const keys = Object.keys(obj).map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join('&');
+    const url = `${FS_BASE}/${path}?${keys}&key=${FIREBASE_API_KEY}`;
+    await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(toFirestore(obj))
+    });
+  } catch(e) { console.error('fsSet error', e); }
+}
+
+async function fsList(collection) {
+  try {
+    const res = await fetch(`${FS_BASE}/${collection}?key=${FIREBASE_API_KEY}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!data.documents) return [];
+    return data.documents.map(d => ({
+      id: d.name.split('/').pop(),
+      ...fromFirestore(d.fields)
+    }));
+  } catch(e) { console.error('fsList error', e); return []; }
+}
+
+async function fsDelete(path) {
+  try {
+    await fetch(`${FS_BASE}/${path}?key=${FIREBASE_API_KEY}`, { method: 'DELETE' });
+  } catch(e) { console.error('fsDelete error', e); }
+}
+
+// ─────────────────────────────────────────────
+// DATA HELPERS
 // ─────────────────────────────────────────────
 async function getMeta() {
-  if (!db) return { tenants: 0, totalUnits: 0 };
-  try {
-    const snap = await db.collection('valorhousing').doc('meta').get();
-    return snap.exists ? snap.data() : { tenants: 0, totalUnits: 0 };
-  } catch(e) { return { tenants: 0, totalUnits: 0 }; }
+  const data = await fsGet('valorhousing/meta');
+  return data || { tenants: 0, totalUnits: 0 };
 }
 
 async function saveMeta(data) {
-  if (!db) return;
-  try { await db.collection('valorhousing').doc('meta').set(data, { merge: true }); }
-  catch(e) { console.error('saveMeta error', e); }
+  await fsSet('valorhousing/meta', data);
 }
 
 async function getVoids() {
-  if (!db) return [];
-  try {
-    const snap = await db.collection('valorhousing_voids').get();
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  } catch(e) { return []; }
+  return await fsList('valorhousing_voids');
 }
 
 async function saveVoid(v) {
-  if (!db) return;
-  try {
-    const id = (v.address + '_' + (v.unit || '')).replace(/\s+/g, '_').toLowerCase();
-    v.id = id;
-    await db.collection('valorhousing_voids').doc(id).set(v, { merge: true });
-  } catch(e) { console.error('saveVoid error', e); }
+  const id = (v.address + '_' + (v.unit || '')).replace(/\s+/g, '_').toLowerCase();
+  v.id = id;
+  await fsSet(`valorhousing_voids/${id}`, v);
 }
 
 async function updateVoidStatus(address, status) {
-  if (!db) return;
-  try {
-    const snap = await db.collection('valorhousing_voids').get();
-    const batch = db.batch();
-    snap.docs.forEach(d => {
-      if (d.data().address.toLowerCase().includes(address.toLowerCase())) {
-        batch.update(d.ref, { status });
-      }
-    });
-    await batch.commit();
-  } catch(e) { console.error('updateVoidStatus error', e); }
+  const voids = await getVoids();
+  for (const v of voids) {
+    if (v.address.toLowerCase().includes(address.toLowerCase())) {
+      await fsSet(`valorhousing_voids/${v.id}`, { ...v, status });
+    }
+  }
 }
 
 async function deleteVoid(address) {
-  if (!db) return;
-  try {
-    const snap = await db.collection('valorhousing_voids').get();
-    const batch = db.batch();
-    snap.docs.forEach(d => {
-      if (d.data().address.toLowerCase().includes(address.toLowerCase())) {
-        batch.delete(d.ref);
-      }
-    });
-    await batch.commit();
-  } catch(e) { console.error('deleteVoid error', e); }
+  const voids = await getVoids();
+  for (const v of voids) {
+    if (v.address.toLowerCase().includes(address.toLowerCase())) {
+      await fsDelete(`valorhousing_voids/${v.id}`);
+    }
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -145,32 +181,26 @@ async function processUpdate(text) {
   let totalUnits = meta.totalUnits || 0;
 
   if (action === 'add_void') {
-    const v = {
-      address:     data.address    || 'Unknown',
-      unit:        data.unit       || '',
-      dateVacated: data.dateVacated|| 'N/A',
-      reason:      data.reason     || '',
-      reLetDate:   data.reLetDate  || '',
-      status:      data.status     || 'Vacant',
+    await saveVoid({
+      address:     data.address     || 'Unknown',
+      unit:        data.unit        || '',
+      dateVacated: data.dateVacated || 'N/A',
+      reason:      data.reason      || '',
+      reLetDate:   data.reLetDate   || '',
+      status:      data.status      || 'Vacant',
       addedAt:     new Date().toISOString()
-    };
-    await saveVoid(v);
-
+    });
   } else if (action === 'update_void') {
     await updateVoidStatus(data.address, data.status);
-
   } else if (action === 'remove_void') {
     await deleteVoid(data.address);
-
   } else if (action === 'move_in') {
     tenants += (data.count || 1);
     if (totalUnits < tenants) totalUnits = tenants;
     await saveMeta({ tenants, totalUnits });
-
   } else if (action === 'move_out') {
     tenants = Math.max(0, tenants - (data.count || 1));
     await saveMeta({ tenants, totalUnits });
-
   } else if (action === 'set_total_units') {
     await saveMeta({ tenants, totalUnits: data.total || 0 });
   }
@@ -188,7 +218,7 @@ Your job:
 
 Void fields: address, unit (optional), dateVacated, reason (optional), reLetDate (optional), status (optional — defaults to Vacant).
 
-Tenant tracking: record total units and occupied units. Occupancy rate = (tenants / totalUnits) × 100.
+Tenant tracking: record total units and occupied units. Occupancy rate = (tenants / totalUnits) x 100.
 
 Rules:
 - Confirm every update clearly.
@@ -198,7 +228,7 @@ Rules:
 - Use bullet points for lists. Always include totals in summaries.
 - Use *bold* for emphasis (WhatsApp markdown).
 
-DATA SYNC — at the END of every response that changes data, output exactly one line:
+DATA SYNC: At the END of every response that changes data, output exactly one line:
 DATA_UPDATE:{"action":"...","data":{...}}
 
 Actions: add_void | update_void | remove_void | move_in | move_out | set_total_units
@@ -214,40 +244,36 @@ Fields per action:
 Current DB state is appended to every user message in [brackets].`;
 
 // ─────────────────────────────────────────────
-// STRIP DATA_UPDATE FROM REPLY
+// CLEAN REPLY
 // ─────────────────────────────────────────────
 function cleanReply(text) {
   return text.replace(/DATA_UPDATE:\s*\{[\s\S]*?\}\s*/g, '').trim();
 }
 
 // ─────────────────────────────────────────────
-// MAIN WEBHOOK
+// WEBHOOK
 // ─────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
 
   try {
     const incomingMsg = req.body.Body?.trim();
-    const from        = req.body.From; // e.g. whatsapp:+447911123456
+    const from        = req.body.From;
 
     if (!incomingMsg) {
       twiml.message('Please send a text message.');
       return res.type('text/xml').send(twiml.toString());
     }
 
-    // Load current DB state
     const meta  = await getMeta();
     const voids = await getVoids();
 
-    // Build context message
     const ctx = `${incomingMsg}\n\n[DB: tenants=${meta.tenants||0}, totalUnits=${meta.totalUnits||0}, voids=${JSON.stringify(voids)}]`;
 
-    // Get or create session
     const session = getSession(from);
     session.history.push({ role: 'user', content: ctx });
     if (session.history.length > 20) session.history = session.history.slice(-20);
 
-    // Call Claude
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 1000,
@@ -258,15 +284,13 @@ app.post('/webhook', async (req, res) => {
     const reply = response.content[0].text;
     session.history.push({ role: 'assistant', content: reply });
 
-    // Process any data updates
     await processUpdate(reply);
 
-    // Send clean reply back via WhatsApp
     twiml.message(cleanReply(reply));
 
   } catch (err) {
     console.error('Webhook error:', err);
-    twiml.message('⚠️ Sorry, something went wrong. Please try again.');
+    twiml.message('Sorry, something went wrong. Please try again.');
   }
 
   res.type('text/xml').send(twiml.toString());
@@ -274,9 +298,9 @@ app.post('/webhook', async (req, res) => {
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'Void Management Bot is running ✅', timestamp: new Date().toISOString() });
+  res.json({ status: 'Void Management Bot is running', timestamp: new Date().toISOString() });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Void Management Bot running on port ${PORT}`);
+  console.log(`Void Management Bot running on port ${PORT}`);
 });
